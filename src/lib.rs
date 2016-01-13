@@ -38,7 +38,7 @@
 //!     }
 //! }
 //! ```
-#![doc(html_root_url="https://sfackler.github.io/rust-postgres/doc/v0.10.2")]
+#![doc(html_root_url="https://sfackler.github.io/rust-postgres/doc/v0.11.0")]
 #![warn(missing_docs)]
 
 extern crate bufstream;
@@ -65,6 +65,7 @@ use std::io::prelude::*;
 use std::marker::Sync as StdSync;
 use std::mem;
 use std::result;
+use std::sync::Arc;
 use std::time::Duration;
 #[cfg(feature = "unix_socket")]
 use std::path::PathBuf;
@@ -361,8 +362,7 @@ pub enum SslMode<'a> {
     Require(&'a NegotiateSsl),
 }
 
-#[derive(Clone)]
-struct CachedStatement {
+struct StatementInfo {
     name: String,
     param_types: Vec<Type>,
     columns: Vec<Column>,
@@ -373,8 +373,8 @@ struct InnerConnection {
     notice_handler: Box<HandleNotice>,
     notifications: VecDeque<Notification>,
     cancel_data: CancelData,
-    unknown_types: HashMap<Oid, Type>,
-    cached_statements: HashMap<String, CachedStatement>,
+    unknown_types: HashMap<Oid, Other>,
+    cached_statements: HashMap<String, Arc<StatementInfo>>,
     parameters: HashMap<String, String>,
     next_stmt_id: u32,
     trans_depth: u32,
@@ -670,28 +670,33 @@ impl InnerConnection {
     fn prepare<'a>(&mut self, query: &str, conn: &'a Connection) -> Result<Statement<'a>> {
         let stmt_name = self.make_stmt_name();
         let (param_types, columns) = try!(self.raw_prepare(&stmt_name, query));
-        Ok(Statement::new(conn, stmt_name, param_types, columns, Cell::new(0), false))
+        let info = Arc::new(StatementInfo {
+            name: stmt_name,
+            param_types: param_types,
+            columns: columns,
+        });
+        Ok(Statement::new(conn, info, Cell::new(0), false))
     }
 
     fn prepare_cached<'a>(&mut self, query: &str, conn: &'a Connection) -> Result<Statement<'a>> {
-        let stmt = self.cached_statements.get(query).cloned();
+        let info = self.cached_statements.get(query).cloned();
 
-        let CachedStatement { name, param_types, columns } = match stmt {
-            Some(stmt) => stmt,
+        let info = match info {
+            Some(info) => info,
             None => {
                 let stmt_name = self.make_stmt_name();
                 let (param_types, columns) = try!(self.raw_prepare(&stmt_name, query));
-                let stmt = CachedStatement {
+                let info = Arc::new(StatementInfo {
                     name: stmt_name,
                     param_types: param_types,
                     columns: columns,
-                };
-                self.cached_statements.insert(query.to_owned(), stmt.clone());
-                stmt
+                });
+                self.cached_statements.insert(query.to_owned(), info.clone());
+                info
             }
         };
 
-        Ok(Statement::new(conn, name, param_types, columns, Cell::new(0), true))
+        Ok(Statement::new(conn, info, Cell::new(0), true))
     }
 
     fn close_statement(&mut self, name: &str, type_: u8) -> Result<()> {
@@ -715,7 +720,7 @@ impl InnerConnection {
         }
 
         if let Some(ty) = self.unknown_types.get(&oid) {
-            return Ok(ty.clone());
+            return Ok(Type::Other(ty.clone()));
         }
 
         // Ew @ doing this manually :(
@@ -787,9 +792,9 @@ impl InnerConnection {
             }
         };
 
-        let type_ = Type::Other(Box::new(Other::new(name, oid, kind, schema)));
+        let type_ = Other::new(name, oid, kind, schema);
         self.unknown_types.insert(oid, type_.clone());
-        Ok(type_)
+        Ok(Type::Other(type_))
     }
 
     fn is_desynchronized(&self) -> bool {
@@ -959,12 +964,12 @@ impl Connection {
     /// ```
     pub fn execute(&self, query: &str, params: &[&ToSql]) -> Result<u64> {
         let (param_types, columns) = try!(self.conn.borrow_mut().raw_prepare("", query));
-        let stmt = Statement::new(self,
-                                  "".to_owned(),
-                                  param_types,
-                                  columns,
-                                  Cell::new(0),
-                                  true);
+        let info = Arc::new(StatementInfo {
+            name: String::new(),
+            param_types: param_types,
+            columns: columns,
+        });
+        let stmt = Statement::new(self, info, Cell::new(0), true);
         stmt.execute(params)
     }
 
@@ -995,12 +1000,12 @@ impl Connection {
     /// ```
     pub fn query<'a>(&'a self, query: &str, params: &[&ToSql]) -> Result<Rows<'a>> {
         let (param_types, columns) = try!(self.conn.borrow_mut().raw_prepare("", query));
-        let stmt = Statement::new(self,
-                                  "".to_owned(),
-                                  param_types,
-                                  columns,
-                                  Cell::new(0),
-                                  true);
+        let info = Arc::new(StatementInfo {
+            name: String::new(),
+            param_types: param_types,
+            columns: columns,
+        });
+        let stmt = Statement::new(self, info, Cell::new(0), true);
         stmt.into_query(params)
     }
 
@@ -1093,6 +1098,16 @@ impl Connection {
         self.conn.borrow_mut().prepare_cached(query, self)
     }
 
+    /// Returns the isolation level which will be used for future transactions.
+    ///
+    /// This is a simple wrapper around `SHOW TRANSACTION ISOLATION LEVEL`.
+    pub fn transaction_isolation(&self) -> Result<IsolationLevel> {
+        let mut conn = self.conn.borrow_mut();
+        check_desync!(conn);
+        let result = try!(conn.quick_query("SHOW TRANSACTION ISOLATION LEVEL"));
+        IsolationLevel::parse(result[0][0].as_ref().unwrap())
+    }
+
     /// Sets the isolation level which will be used for future transactions.
     ///
     /// This is a simple wrapper around `SET TRANSACTION ISOLATION LEVEL ...`.
@@ -1102,16 +1117,6 @@ impl Connection {
     /// This will not change the behavior of an active transaction.
     pub fn set_transaction_isolation(&self, level: IsolationLevel) -> Result<()> {
         self.batch_execute(level.to_set_query())
-    }
-
-    /// Returns the isolation level which will be used for future transactions.
-    ///
-    /// This is a simple wrapper around `SHOW TRANSACTION ISOLATION LEVEL`.
-    pub fn transaction_isolation(&self) -> Result<IsolationLevel> {
-        let mut conn = self.conn.borrow_mut();
-        check_desync!(conn);
-        let result = try!(conn.quick_query("SHOW TRANSACTION ISOLATION LEVEL"));
-        IsolationLevel::parse(result[0][0].as_ref().unwrap())
     }
 
     /// Execute a sequence of SQL statements.
@@ -1383,17 +1388,17 @@ fn read_rows(conn: &mut InnerConnection, buf: &mut VecDeque<Vec<Option<Vec<u8>>>
 
 /// A trait allowing abstraction over connections and transactions
 pub trait GenericConnection {
-    /// Like `Connection::prepare`.
-    fn prepare<'a>(&'a self, query: &str) -> Result<Statement<'a>>;
-
-    /// Like `Connection::prepare_cached`.
-    fn prepare_cached<'a>(&'a self, query: &str) -> Result<Statement<'a>>;
-
     /// Like `Connection::execute`.
     fn execute(&self, query: &str, params: &[&ToSql]) -> Result<u64>;
 
     /// Like `Connection::query`.
     fn query<'a>(&'a self, query: &str, params: &[&ToSql]) -> Result<Rows<'a>>;
+
+    /// Like `Connection::prepare`.
+    fn prepare<'a>(&'a self, query: &str) -> Result<Statement<'a>>;
+
+    /// Like `Connection::prepare_cached`.
+    fn prepare_cached<'a>(&'a self, query: &str) -> Result<Statement<'a>>;
 
     /// Like `Connection::transaction`.
     fn transaction<'a>(&'a self) -> Result<Transaction<'a>>;
@@ -1406,20 +1411,20 @@ pub trait GenericConnection {
 }
 
 impl GenericConnection for Connection {
-    fn prepare<'a>(&'a self, query: &str) -> Result<Statement<'a>> {
-        self.prepare(query)
-    }
-
-    fn prepare_cached<'a>(&'a self, query: &str) -> Result<Statement<'a>> {
-        self.prepare_cached(query)
-    }
-
     fn execute(&self, query: &str, params: &[&ToSql]) -> Result<u64> {
         self.execute(query, params)
     }
 
     fn query<'a>(&'a self, query: &str, params: &[&ToSql]) -> Result<Rows<'a>> {
         self.query(query, params)
+    }
+
+    fn prepare<'a>(&'a self, query: &str) -> Result<Statement<'a>> {
+        self.prepare(query)
+    }
+
+    fn prepare_cached<'a>(&'a self, query: &str) -> Result<Statement<'a>> {
+        self.prepare_cached(query)
     }
 
     fn transaction<'a>(&'a self) -> Result<Transaction<'a>> {
@@ -1436,20 +1441,20 @@ impl GenericConnection for Connection {
 }
 
 impl<'a> GenericConnection for Transaction<'a> {
-    fn prepare<'b>(&'b self, query: &str) -> Result<Statement<'b>> {
-        self.prepare(query)
-    }
-
-    fn prepare_cached<'b>(&'b self, query: &str) -> Result<Statement<'b>> {
-        self.prepare_cached(query)
-    }
-
     fn execute(&self, query: &str, params: &[&ToSql]) -> Result<u64> {
         self.execute(query, params)
     }
 
     fn query<'b>(&'b self, query: &str, params: &[&ToSql]) -> Result<Rows<'b>> {
         self.query(query, params)
+    }
+
+    fn prepare<'b>(&'b self, query: &str) -> Result<Statement<'b>> {
+        self.prepare(query)
+    }
+
+    fn prepare_cached<'b>(&'b self, query: &str) -> Result<Statement<'b>> {
+        self.prepare_cached(query)
     }
 
     fn transaction<'b>(&'b self) -> Result<Transaction<'b>> {
@@ -1497,9 +1502,7 @@ trait SessionInfoNew<'a> {
 
 trait StatementInternals<'conn> {
     fn new(conn: &'conn Connection,
-           name: String,
-           param_types: Vec<Type>,
-           columns: Vec<Column>,
+           info: Arc<StatementInfo>,
            next_portal_id: Cell<u32>,
            finished: bool)
            -> Statement<'conn>;
